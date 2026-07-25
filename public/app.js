@@ -33,8 +33,40 @@ thresholdInput.addEventListener("input", () => {
 toggleBtn.addEventListener("click", () => (running ? stop() : start()));
 
 async function start() {
+  // Secure-context guard: getUserMedia only exists on https:// or localhost.
+  if (!window.isSecureContext) {
+    setStatus(
+      "Not a secure context. Open the site over HTTPS (or http://localhost). Mic is blocked otherwise.",
+      "error"
+    );
+    return;
+  }
+
+  // Prefer the modern API; fall back to the legacy callback API only if needed.
+  let getUM = null;
+  if (navigator.mediaDevices?.getUserMedia) {
+    getUM = (c) => navigator.mediaDevices.getUserMedia(c);
+  } else {
+    const legacy =
+      navigator.getUserMedia ||
+      navigator.webkitGetUserMedia ||
+      navigator.mozGetUserMedia;
+    if (legacy) {
+      getUM = (c) => new Promise((res, rej) => legacy.call(navigator, c, res, rej));
+    }
+  }
+
+  if (!getUM) {
+    setStatus(
+      "This browser exposes no microphone API here. If the page is embedded in a frame, it needs allow=\"microphone\".",
+      "error"
+    );
+    return;
+  }
+
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
+    setStatus("Requesting microphone permission…");
+    stream = await getUM({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
@@ -42,7 +74,18 @@ async function start() {
       },
     });
   } catch (err) {
-    setStatus("Microphone access denied.", "error");
+    // Surface the ACTUAL reason instead of always saying "denied".
+    const map = {
+      NotAllowedError: "Permission denied or dismissed. Allow mic access in the browser/site settings, then click again.",
+      SecurityError: "Blocked by the browser security policy (needs HTTPS / allowed frame).",
+      NotFoundError: "No microphone found on this device.",
+      NotReadableError: "The microphone is in use by another app or blocked by the OS.",
+      OverconstrainedError: "No microphone matches the requested settings.",
+      AbortError: "Microphone start was aborted. Try again.",
+    };
+    const msg = map[err.name] || `${err.name || "Error"}: ${err.message || "could not start microphone."}`;
+    setStatus(msg, "error");
+    console.error("getUserMedia failed:", err);
     return;
   }
 
