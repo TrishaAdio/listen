@@ -2,6 +2,9 @@ import express from "express";
 import multer from "multer";
 import dotenv from "dotenv";
 import path from "node:path";
+import fs from "node:fs";
+import http from "node:http";
+import https from "node:https";
 import { fileURLToPath } from "node:url";
 import { printBanner, c } from "./banner.js";
 
@@ -217,11 +220,33 @@ function escapeHtml(s) {
     .replace(/>/g, "&gt;");
 }
 
-app.listen(PORT, () => {
+// ---- Start server: HTTPS if certs are provided, else HTTP ----
+// Mobile browsers require HTTPS (or localhost) to grant microphone access.
+// Provide cert paths via SSL_KEY / SSL_CERT, or drop certs/key.pem + certs/cert.pem.
+const SSL_KEY = process.env.SSL_KEY || path.join(__dirname, "certs", "key.pem");
+const SSL_CERT = process.env.SSL_CERT || path.join(__dirname, "certs", "cert.pem");
+const hasCerts = fs.existsSync(SSL_KEY) && fs.existsSync(SSL_CERT);
+
+function onListen(scheme) {
   printBanner({
     port: PORT,
     provider: PROVIDER,
     model: currentModel(),
     telegram: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_ADMIN_ID),
+    scheme,
   });
-});
+  if (scheme === "http") {
+    console.log(
+      c.yellow(
+        "  Note: phones need HTTPS for mic access. Run `npm run cert` then restart for https://\n"
+      )
+    );
+  }
+}
+
+if (hasCerts) {
+  const creds = { key: fs.readFileSync(SSL_KEY), cert: fs.readFileSync(SSL_CERT) };
+  https.createServer(creds, app).listen(PORT, "0.0.0.0", () => onListen("https"));
+} else {
+  http.createServer(app).listen(PORT, "0.0.0.0", () => onListen("http"));
+}

@@ -29,13 +29,31 @@ const ART = [
   "  ╚══════╝╚═╝╚══════╝   ╚═╝   ╚══════╝╚═╝  ╚═══╝",
 ];
 
-export function printBanner({ port, provider, model, telegram }) {
+import os from "node:os";
+
+function lanIP() {
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name] || []) {
+      if (net.family === "IPv4" && !net.internal) return net.address;
+    }
+  }
+  return null;
+}
+
+export function printBanner({ port, provider, model, telegram, scheme = "http" }) {
   const line = c.gray("  " + "─".repeat(48));
+  const ip = lanIP();
   console.log("");
   for (const row of ART) console.log(c.cyan(row));
   console.log(c.dim("  mic → english speech → transcribe → telegram"));
   console.log(line);
-  console.log(`  ${c.bold("URL")}       ${c.green(`http://localhost:${port}`)}`);
+  console.log(`  ${c.bold("Local")}     ${c.green(`${scheme}://localhost:${port}`)}`);
+  if (ip) {
+    const phone = scheme === "https" ? c.green : c.yellow;
+    console.log(`  ${c.bold("Phone")}     ${phone(`${scheme}://${ip}:${port}`)}`);
+  }
+  console.log(`  ${c.bold("Secure")}    ${scheme === "https" ? c.green("yes (mic works on phones)") : c.red("no  (mic blocked on phones)")}`);
   console.log(`  ${c.bold("Model")}     ${c.magenta(`${provider} (${model})`)}`);
   console.log(
     `  ${c.bold("Telegram")}  ${
