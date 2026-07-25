@@ -28,6 +28,7 @@ let clipTimer = null;
 // Adaptive detection state
 let noiseFloor = null; // EMA of RMS during silence — the device's own baseline
 let peak = 0.06; // decaying peak for auto-scaling the meter
+let wakeLock = null; // keeps the phone screen awake so the tab isn't suspended
 
 let SENS = Number(sensInput.value); // 1 (least) .. 10 (most sensitive)
 sensInput.addEventListener("input", () => {
@@ -177,8 +178,40 @@ async function start(isAuto) {
   toggleBtn.style.display = "none"; // live mode — no manual start/stop
   statusDot.classList.add("live");
   setStatus("Live — listening. Just speak.");
+  acquireWakeLock(); // keep the screen on so the mic keeps running for hours
   monitor();
 }
+
+// ---- Keep the phone awake so listening survives for hours -------------
+async function acquireWakeLock() {
+  try {
+    if ("wakeLock" in navigator) {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener?.("release", () => {
+        wakeLock = null;
+      });
+    }
+  } catch (err) {
+    console.warn("Wake Lock unavailable:", err?.message);
+  }
+}
+
+async function releaseWakeLock() {
+  try {
+    await wakeLock?.release();
+  } catch {}
+  wakeLock = null;
+}
+
+// When you come back to the tab (or screen turns back on), re-acquire the
+// wake lock and resume the audio graph, which mobile browsers suspend.
+document.addEventListener("visibilitychange", async () => {
+  if (document.visibilityState !== "visible" || !running) return;
+  if (!wakeLock) acquireWakeLock();
+  if (audioCtx && audioCtx.state === "suspended") {
+    try { await audioCtx.resume(); } catch {}
+  }
+});
 
 function showStartButton() {
   toggleBtn.style.display = "";
