@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mic → Transcribe → Telegram</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="head">
+        <div class="dot" id="statusDot"></div>
+        <h1>Live Mic Relay</h1>
+        <p class="sub">Listens, detects English speech, transcribes, and sends it to the admin on Telegram.</p>
+      </header>
+
+      <section class="controls">
+        <button id="toggleBtn" class="btn primary">Start listening</button>
+        <div class="meter"><div class="meter-fill" id="meterFill"></div></div>
+      </section>
+
+      <section class="status">
+        <span id="statusText">Idle</span>
+      </section>
+
+      <section class="settings">
+        <label>
+          Sensitivity
+          <input type="range" id="threshold" min="2" max="40" value="12" />
+        </label>
+        <span class="hint" id="thresholdVal">12</span>
+      </section>
+
+      <section class="log">
+        <h2>Transcripts</h2>
+        <ul id="log"></ul>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
