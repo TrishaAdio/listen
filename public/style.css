@@ -82,6 +82,31 @@ body {
   margin-bottom: 16px;
 }
 
+.diag {
+  margin-bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.diag:empty { display: none; }
+.diag-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+.diag-row span { color: var(--muted); }
+.diag-row b { font-weight: 600; }
+.diag-row.ok { border-left: 3px solid var(--green); }
+.diag-row.ok b { color: var(--green); }
+.diag-row.bad { border-left: 3px solid var(--red); }
+.diag-row.bad b { color: var(--red); }
+
 .settings {
   display: flex; align-items: center; gap: 12px;
   margin-bottom: 24px; font-size: 13px; color: var(--muted);

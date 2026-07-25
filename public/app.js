@@ -32,6 +32,80 @@ thresholdInput.addEventListener("input", () => {
 
 toggleBtn.addEventListener("click", () => (running ? stop() : start()));
 
+// ---- Environment diagnostics -------------------------------------------
+// Runs on load so mobile users can see exactly what's blocking the mic
+// (in-app browser, insecure context, missing API, denied permission).
+const diagEl = document.getElementById("diag");
+
+function detectInAppBrowser() {
+  const ua = navigator.userAgent || "";
+  const apps = [
+    ["Telegram", /Telegram/i],
+    ["Instagram", /Instagram/i],
+    ["Facebook", /FBAN|FBAV|FB_IAB/i],
+    ["Messenger", /Messenger/i],
+    ["Twitter/X", /Twitter/i],
+    ["TikTok", /musical_ly|Bytedance|TikTok/i],
+    ["Snapchat", /Snapchat/i],
+    ["LINE", /\bLine\//i],
+    ["WhatsApp", /WhatsApp/i],
+    ["WeChat", /MicroMessenger/i],
+    ["Android WebView", /; wv\)/i],
+  ];
+  for (const [name, re] of apps) if (re.test(ua)) return name;
+  return null;
+}
+
+async function runDiagnostics() {
+  const rows = [];
+  const secure = window.isSecureContext;
+  const hasApi = Boolean(
+    navigator.mediaDevices?.getUserMedia ||
+      navigator.getUserMedia ||
+      navigator.webkitGetUserMedia
+  );
+  const inApp = detectInAppBrowser();
+
+  let perm = "unknown";
+  try {
+    if (navigator.permissions?.query) {
+      const p = await navigator.permissions.query({ name: "microphone" });
+      perm = p.state; // granted | denied | prompt
+    }
+  } catch { /* not all browsers support querying microphone */ }
+
+  rows.push(row("Secure context (HTTPS)", secure, secure ? "yes" : "NO — mic blocked"));
+  rows.push(row("Microphone API present", hasApi, hasApi ? "yes" : "NO"));
+  rows.push(row("Mic permission", perm !== "denied", perm));
+  if (inApp) {
+    rows.push(
+      `<div class="diag-row bad"><span>Browser</span><b>${inApp} in-app browser — mic usually blocked</b></div>`
+    );
+  }
+
+  diagEl.innerHTML = rows.join("");
+
+  // Loud, actionable banner for the most common mobile blocker.
+  if (inApp) {
+    setStatus(
+      `Opened inside the ${inApp} in-app browser, which blocks the microphone. Tap the ⋯ menu and choose "Open in Chrome/Safari".`,
+      "error"
+    );
+  } else if (!secure) {
+    setStatus("Not a secure context — open the https:// (ngrok) URL directly.", "error");
+  } else if (!hasApi) {
+    setStatus("This browser exposes no microphone API. Open in Chrome or Safari.", "error");
+  } else if (perm === "denied") {
+    setStatus("Mic permission is blocked for this site. Enable it in browser site settings, then reload.", "error");
+  }
+}
+
+function row(label, ok, value) {
+  return `<div class="diag-row ${ok ? "ok" : "bad"}"><span>${label}</span><b>${value}</b></div>`;
+}
+
+runDiagnostics();
+
 async function start() {
   // Secure-context guard: getUserMedia only exists on https:// or localhost.
   if (!window.isSecureContext) {
