@@ -34,7 +34,15 @@ function currentModel() {
 }
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_ADMIN_ID = process.env.TELEGRAM_ADMIN_ID;
+// Accept multiple admins: TELEGRAM_ADMIN_ID can be comma-separated, and
+// TELEGRAM_ADMIN_ID_2 is also honored. Deduped, order preserved.
+const ADMIN_IDS = [
+  ...String(process.env.TELEGRAM_ADMIN_ID || "").split(","),
+  ...String(process.env.TELEGRAM_ADMIN_ID_2 || "").split(","),
+]
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .filter((v, i, a) => a.indexOf(v) === i);
 
 const app = express();
 app.use(express.static(path.join(__dirname, "public")));
@@ -50,7 +58,8 @@ app.get("/api/health", (_req, res) => {
     ok: true,
     provider: PROVIDER,
     transcription_configured: Boolean(currentApiKey()),
-    telegram_configured: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_ADMIN_ID),
+    telegram_configured: Boolean(TELEGRAM_BOT_TOKEN && ADMIN_IDS.length),
+    admin_count: ADMIN_IDS.length,
   });
 });
 
@@ -61,15 +70,18 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
       return res.status(400).json({ error: "No audio uploaded." });
     }
 
-    const text = (await transcribe(req.file)).trim();
+    const raw = (await transcribe(req.file)).trim();
 
     // Only act when we actually heard meaningful English speech.
-    if (!isMeaningfulEnglish(text)) {
-      return res.json({ text, forwarded: false, reason: "no meaningful speech" });
+    if (!isMeaningfulEnglish(raw)) {
+      return res.json({ text: raw, forwarded: false, reason: "no meaningful speech" });
     }
 
+    // Normalize: spoken numbers → digits, currency words → the ₹ (INR) symbol.
+    const text = formatText(raw);
+
     let forwarded = false;
-    if (TELEGRAM_BOT_TOKEN && TELEGRAM_ADMIN_ID) {
+    if (TELEGRAM_BOT_TOKEN && ADMIN_IDS.length) {
       forwarded = await sendToTelegram(text);
     }
 
@@ -189,28 +201,94 @@ function isMeaningfulEnglish(text) {
   return true;
 }
 
-// ---- Telegram delivery ----
+// ---- Telegram delivery (to every configured admin) ----
 async function sendToTelegram(text) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const body = {
-    chat_id: TELEGRAM_ADMIN_ID,
-    text: `<b>Live transcript</b>\n<blockquote>${escapeHtml(text)}</blockquote>`,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  };
+  const message = `<b>Verified</b>\n<blockquote>${escapeHtml(text)}</blockquote>`;
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const results = await Promise.all(
+    ADMIN_IDS.map(async (chatId) => {
+      try {
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: message,
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+          }),
+        });
+        if (!resp.ok) {
+          const detail = await resp.text().catch(() => "");
+          console.error(`telegram error for ${chatId}:`, resp.status, detail.slice(0, 200));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        console.error(`telegram send failed for ${chatId}:`, err.message);
+        return false;
+      }
+    })
+  );
 
-  if (!resp.ok) {
-    const detail = await resp.text().catch(() => "");
-    console.error("telegram error:", resp.status, detail.slice(0, 300));
-    return false;
+  // Forwarded if it reached at least one admin.
+  return results.some(Boolean);
+}
+
+// ---- Text normalization: spoken numbers → digits, "rupees" → ₹ ----
+const SMALL = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7,
+  eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13,
+  fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
+};
+const TENS = {
+  twenty: 20, thirty: 30, forty: 40, fifty: 50,
+  sixty: 60, seventy: 70, eighty: 80, ninety: 90,
+};
+const MAG = {
+  hundred: 100, thousand: 1000, lakh: 100000, lakhs: 100000,
+  crore: 10000000, crores: 10000000, million: 1000000, billion: 1000000000,
+};
+const NUM_WORDS = [...Object.keys(SMALL), ...Object.keys(TENS), ...Object.keys(MAG)];
+
+function chunkToNumber(tokens) {
+  let total = 0;
+  let current = 0;
+  for (const tok of tokens) {
+    const w = tok.toLowerCase();
+    if (w === "and") continue;
+    if (w in SMALL) current += SMALL[w];
+    else if (w in TENS) current += TENS[w];
+    else if (w in MAG) {
+      const m = MAG[w];
+      if (m >= 1000) {
+        total += (current || 1) * m;
+        current = 0;
+      } else {
+        current = (current || 1) * m; // hundred
+      }
+    }
   }
-  return true;
+  return total + current;
+}
+
+function formatText(input) {
+  let text = input;
+
+  // Convert runs of number words (optionally joined by "and") into digits.
+  const runRe = new RegExp(
+    `\\b(?:${NUM_WORDS.join("|")})(?:[\\s-]+(?:and[\\s-]+)?(?:${NUM_WORDS.join("|")}))*\\b`,
+    "gi"
+  );
+  text = text.replace(runRe, (m) => String(chunkToNumber(m.split(/[\s-]+/))));
+
+  // Currency: "<amount> rupees/rupee/rs/inr" and "rs/inr <amount>" → ₹<amount>.
+  text = text.replace(/(\d+(?:\.\d+)?)\s*(?:rupees|rupee|rs\.?|inr)\b/gi, "₹$1");
+  text = text.replace(/\b(?:rs\.?|inr)\s*(\d+(?:\.\d+)?)/gi, "₹$1");
+  // Also handle "paisa/paise" left dangling rarely — leave as-is otherwise.
+
+  return text.replace(/\s{2,}/g, " ").trim();
 }
 
 function escapeHtml(s) {
@@ -232,7 +310,7 @@ function onListen(scheme) {
     port: PORT,
     provider: PROVIDER,
     model: currentModel(),
-    telegram: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_ADMIN_ID),
+    telegram: Boolean(TELEGRAM_BOT_TOKEN && ADMIN_IDS.length),
     scheme,
   });
   if (scheme === "http") {
