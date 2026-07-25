@@ -16,6 +16,19 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-transcribe";
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || "whisper-large-v3-turbo";
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL || "scribe_v1";
+
+function currentApiKey() {
+  if (PROVIDER === "elevenlabs") return ELEVENLABS_API_KEY;
+  if (PROVIDER === "groq") return GROQ_API_KEY;
+  return OPENAI_API_KEY;
+}
+function currentModel() {
+  if (PROVIDER === "elevenlabs") return ELEVENLABS_MODEL;
+  if (PROVIDER === "groq") return GROQ_MODEL;
+  return OPENAI_MODEL;
+}
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_ADMIN_ID = process.env.TELEGRAM_ADMIN_ID;
@@ -33,8 +46,7 @@ app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     provider: PROVIDER,
-    transcription_configured:
-      PROVIDER === "groq" ? Boolean(GROQ_API_KEY) : Boolean(OPENAI_API_KEY),
+    transcription_configured: Boolean(currentApiKey()),
     telegram_configured: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_ADMIN_ID),
   });
 });
@@ -80,28 +92,34 @@ async function transcribe(file) {
 
   const form = new FormData();
   form.append("file", blob, filename);
-  form.append("language", "en"); // English detection only
-  form.append("response_format", "json");
 
   let url;
-  let apiKey;
-  if (PROVIDER === "groq") {
+  let headers;
+
+  if (PROVIDER === "elevenlabs") {
+    // ElevenLabs Scribe — different endpoint, auth header, and field names.
+    if (!ELEVENLABS_API_KEY) throw new Error("ELEVENLABS_API_KEY is not set.");
+    url = "https://api.elevenlabs.io/v1/speech-to-text";
+    headers = { "xi-api-key": ELEVENLABS_API_KEY };
+    form.append("model_id", ELEVENLABS_MODEL);
+    form.append("language_code", "eng"); // English only (ISO-639-3)
+  } else if (PROVIDER === "groq") {
     if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY is not set.");
     url = "https://api.groq.com/openai/v1/audio/transcriptions";
-    apiKey = GROQ_API_KEY;
+    headers = { Authorization: `Bearer ${GROQ_API_KEY}` };
     form.append("model", GROQ_MODEL);
+    form.append("language", "en");
+    form.append("response_format", "json");
   } else {
     if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not set.");
     url = "https://api.openai.com/v1/audio/transcriptions";
-    apiKey = OPENAI_API_KEY;
+    headers = { Authorization: `Bearer ${OPENAI_API_KEY}` };
     form.append("model", OPENAI_MODEL);
+    form.append("language", "en");
+    form.append("response_format", "json");
   }
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: form,
-  });
+  const resp = await fetch(url, { method: "POST", headers, body: form });
 
   if (!resp.ok) {
     const detail = await resp.text().catch(() => "");
@@ -203,7 +221,7 @@ app.listen(PORT, () => {
   printBanner({
     port: PORT,
     provider: PROVIDER,
-    model: PROVIDER === "groq" ? GROQ_MODEL : OPENAI_MODEL,
+    model: currentModel(),
     telegram: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_ADMIN_ID),
   });
 });
