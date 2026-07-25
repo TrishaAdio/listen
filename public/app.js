@@ -1,19 +1,20 @@
 // ---- Live mic relay -----------------------------------------------------
-// Continuously monitors the mic. When the volume rises above the threshold
-// (speech), it records until a short silence, then ships that clip to the
-// server for transcription + Telegram delivery. Nothing is sent on silence.
+// Live, continuous listening. After a single tap to grant mic access it runs
+// forever: an adaptive voice-activity detector (auto-calibrates to the device's
+// own noise floor, so it works on quiet phone mics too) records each utterance,
+// then ships it for transcription + Telegram delivery. Nothing sent on silence.
 
 const toggleBtn = document.getElementById("toggleBtn");
 const meterFill = document.getElementById("meterFill");
 const statusText = document.getElementById("statusText");
 const statusDot = document.getElementById("statusDot");
 const logEl = document.getElementById("log");
-const thresholdInput = document.getElementById("threshold");
-const thresholdVal = document.getElementById("thresholdVal");
+const sensInput = document.getElementById("threshold");
+const sensVal = document.getElementById("thresholdVal");
 
-// Tunables
+// Timing tunables
 const SILENCE_MS = 900; // silence after speech before we cut the clip
-const MIN_SPEECH_MS = 350; // ignore blips shorter than this
+const MIN_SPEECH_MS = 250; // ignore blips shorter than this
 const MAX_CLIP_MS = 15000; // hard cap so long talking still ships
 
 let running = false;
@@ -24,17 +25,22 @@ let speechStart = 0;
 let lastLoud = 0;
 let clipTimer = null;
 
-let VOLUME_THRESHOLD = Number(thresholdInput.value);
-thresholdInput.addEventListener("input", () => {
-  VOLUME_THRESHOLD = Number(thresholdInput.value);
-  thresholdVal.textContent = thresholdInput.value;
+// Adaptive detection state
+let noiseFloor = null; // EMA of RMS during silence — the device's own baseline
+let peak = 0.06; // decaying peak for auto-scaling the meter
+
+let SENS = Number(sensInput.value); // 1 (least) .. 10 (most sensitive)
+sensInput.addEventListener("input", () => {
+  SENS = Number(sensInput.value);
+  sensVal.textContent = sensInput.value;
 });
 
-toggleBtn.addEventListener("click", () => (running ? stop() : start()));
+// Single gesture: the tap that grants mic access, then it's live forever.
+toggleBtn.addEventListener("click", () => {
+  if (!running) start(false);
+});
 
 // ---- Environment diagnostics -------------------------------------------
-// Runs on load so mobile users can see exactly what's blocking the mic
-// (in-app browser, insecure context, missing API, denied permission).
 const diagEl = document.getElementById("diag");
 
 function detectInAppBrowser() {
@@ -57,7 +63,6 @@ function detectInAppBrowser() {
 }
 
 async function runDiagnostics() {
-  const rows = [];
   const secure = window.isSecureContext;
   const hasApi = Boolean(
     navigator.mediaDevices?.getUserMedia ||
@@ -70,148 +75,148 @@ async function runDiagnostics() {
   try {
     if (navigator.permissions?.query) {
       const p = await navigator.permissions.query({ name: "microphone" });
-      perm = p.state; // granted | denied | prompt
+      perm = p.state;
     }
-  } catch { /* not all browsers support querying microphone */ }
+  } catch { /* microphone permission not queryable in this browser */ }
 
-  rows.push(row("Secure context (HTTPS)", secure, secure ? "yes" : "NO — mic blocked"));
-  rows.push(row("Microphone API present", hasApi, hasApi ? "yes" : "NO"));
-  rows.push(row("Mic permission", perm !== "denied", perm));
+  const rows = [
+    row("Secure context (HTTPS)", secure, secure ? "yes" : "NO — mic blocked"),
+    row("Microphone API present", hasApi, hasApi ? "yes" : "NO"),
+    row("Mic permission", perm !== "denied", perm),
+  ];
   if (inApp) {
     rows.push(
       `<div class="diag-row bad"><span>Browser</span><b>${inApp} in-app browser — mic usually blocked</b></div>`
     );
   }
-
   diagEl.innerHTML = rows.join("");
 
-  // Loud, actionable banner for the most common mobile blocker.
+  // Hard blockers first.
   if (inApp) {
-    setStatus(
-      `Opened inside the ${inApp} in-app browser, which blocks the microphone. Tap the ⋯ menu and choose "Open in Chrome/Safari".`,
-      "error"
-    );
-  } else if (!secure) {
-    setStatus("Not a secure context — open the https:// (ngrok) URL directly.", "error");
-  } else if (!hasApi) {
-    setStatus("This browser exposes no microphone API. Open in Chrome or Safari.", "error");
-  } else if (perm === "denied") {
-    setStatus("Mic permission is blocked for this site. Enable it in browser site settings, then reload.", "error");
+    setStatus(`Opened inside the ${inApp} in-app browser, which blocks the mic. Use the ⋯ menu → "Open in Chrome/Safari".`, "error");
+    return { canStart: false };
   }
+  if (!secure) {
+    setStatus("Not a secure context — open the https:// (ngrok) URL directly.", "error");
+    return { canStart: false };
+  }
+  if (!hasApi) {
+    setStatus("This browser exposes no microphone API. Open in Chrome or Safari.", "error");
+    return { canStart: false };
+  }
+  if (perm === "denied") {
+    setStatus("Mic permission is blocked for this site. Enable it in site settings, then reload.", "error");
+    return { canStart: false };
+  }
+  return { canStart: true };
 }
 
 function row(label, ok, value) {
   return `<div class="diag-row ${ok ? "ok" : "bad"}"><span>${label}</span><b>${value}</b></div>`;
 }
 
-runDiagnostics();
+// Boot: diagnose, then try to go live automatically. If the browser needs a
+// user gesture (typical on mobile), show a single tap-to-start button.
+(async function boot() {
+  const { canStart } = await runDiagnostics();
+  if (!canStart) return;
+  start(true);
+})();
 
-async function start() {
-  // Secure-context guard: getUserMedia only exists on https:// or localhost.
-  if (!window.isSecureContext) {
-    setStatus(
-      "Not a secure context. Open the site over HTTPS (or http://localhost). Mic is blocked otherwise.",
-      "error"
-    );
-    return;
-  }
-
-  // Prefer the modern API; fall back to the legacy callback API only if needed.
+async function start(isAuto) {
   let getUM = null;
   if (navigator.mediaDevices?.getUserMedia) {
     getUM = (c) => navigator.mediaDevices.getUserMedia(c);
   } else {
-    const legacy =
-      navigator.getUserMedia ||
-      navigator.webkitGetUserMedia ||
-      navigator.mozGetUserMedia;
-    if (legacy) {
-      getUM = (c) => new Promise((res, rej) => legacy.call(navigator, c, res, rej));
-    }
+    const legacy = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+    if (legacy) getUM = (c) => new Promise((res, rej) => legacy.call(navigator, c, res, rej));
   }
-
   if (!getUM) {
-    setStatus(
-      "This browser exposes no microphone API here. If the page is embedded in a frame, it needs allow=\"microphone\".",
-      "error"
-    );
+    setStatus('No microphone API here. If embedded in a frame it needs allow="microphone".', "error");
     return;
   }
 
   try {
-    setStatus("Requesting microphone permission…");
+    if (!isAuto) setStatus("Requesting microphone permission…");
     stream = await getUM({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
   } catch (err) {
-    // Surface the ACTUAL reason instead of always saying "denied".
+    // If auto-start was blocked for lack of a gesture, just reveal the tap button.
+    if (isAuto && (err.name === "NotAllowedError" || err.name === "SecurityError")) {
+      showStartButton();
+      setStatus("Tap the button to start live listening.");
+      return;
+    }
     const map = {
-      NotAllowedError: "Permission denied or dismissed. Allow mic access in the browser/site settings, then click again.",
-      SecurityError: "Blocked by the browser security policy (needs HTTPS / allowed frame).",
+      NotAllowedError: "Permission denied or dismissed. Allow mic access, then tap again.",
+      SecurityError: "Blocked by browser security policy (needs HTTPS / allowed frame).",
       NotFoundError: "No microphone found on this device.",
       NotReadableError: "The microphone is in use by another app or blocked by the OS.",
       OverconstrainedError: "No microphone matches the requested settings.",
       AbortError: "Microphone start was aborted. Try again.",
     };
-    const msg = map[err.name] || `${err.name || "Error"}: ${err.message || "could not start microphone."}`;
-    setStatus(msg, "error");
+    setStatus(map[err.name] || `${err.name || "Error"}: ${err.message || "could not start microphone."}`, "error");
+    showStartButton();
     console.error("getUserMedia failed:", err);
     return;
   }
 
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") {
+    try { await audioCtx.resume(); } catch {}
+  }
   source = audioCtx.createMediaStreamSource(stream);
   analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 512;
+  analyser.fftSize = 1024;
+  analyser.smoothingTimeConstant = 0.4;
   source.connect(analyser);
 
   running = true;
-  toggleBtn.textContent = "Stop listening";
-  toggleBtn.classList.remove("primary");
-  toggleBtn.classList.add("stop");
+  noiseFloor = null;
+  toggleBtn.style.display = "none"; // live mode — no manual start/stop
   statusDot.classList.add("live");
-  setStatus("Listening… speak into the mic.");
-
+  setStatus("Live — listening. Just speak.");
   monitor();
 }
 
-function stop() {
-  running = false;
-  cancelAnimationFrame(rafId);
-  if (clipTimer) clearTimeout(clipTimer);
-  if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
-  if (stream) stream.getTracks().forEach((t) => t.stop());
-  if (audioCtx) audioCtx.close();
-  speaking = false;
-
-  toggleBtn.textContent = "Start listening";
+function showStartButton() {
+  toggleBtn.style.display = "";
+  toggleBtn.textContent = "Start live listening";
   toggleBtn.classList.add("primary");
-  toggleBtn.classList.remove("stop");
-  statusDot.classList.remove("live", "speaking");
-  meterFill.style.width = "0%";
-  setStatus("Idle");
 }
 
 function monitor() {
-  const data = new Uint8Array(analyser.frequencyBinCount);
+  const buf = new Uint8Array(analyser.fftSize);
 
   const tick = () => {
     if (!running) return;
-    analyser.getByteFrequencyData(data);
+    analyser.getByteTimeDomainData(buf);
 
-    // Average volume (0–255) → simple loudness estimate.
-    let sum = 0;
-    for (let i = 0; i < data.length; i++) sum += data[i];
-    const volume = sum / data.length;
+    // RMS of the waveform → consistent loudness across devices (unlike a
+    // frequency-bin average, which reads very low on phone mics).
+    let sumSq = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const v = (buf[i] - 128) / 128;
+      sumSq += v * v;
+    }
+    const rms = Math.sqrt(sumSq / buf.length);
 
-    meterFill.style.width = `${Math.min(100, (volume / 80) * 100)}%`;
+    // Auto-scaling meter: fills nicely regardless of the device's absolute level.
+    peak = Math.max(peak * 0.995, rms, 0.03);
+    meterFill.style.width = `${Math.min(100, (rms / peak) * 100)}%`;
+
+    // Adapt the noise floor only while NOT speaking, so it learns the room.
+    if (!speaking) {
+      noiseFloor = noiseFloor === null ? rms : noiseFloor * 0.95 + rms * 0.05;
+    }
+    const base = noiseFloor ?? 0.01;
+    const mult = 1.5 + (10 - SENS) * 0.2; // more sensitive slider → lower bar
+    const margin = 0.004 + (10 - SENS) * 0.0016;
+    const trigger = base * mult + margin;
 
     const now = performance.now();
-    if (volume > VOLUME_THRESHOLD) {
+    if (rms > trigger) {
       lastLoud = now;
       if (!speaking) beginClip(now);
     } else if (speaking && now - lastLoud > SILENCE_MS) {
@@ -238,7 +243,6 @@ function beginClip(now) {
   mediaRecorder.onstop = shipClip;
   mediaRecorder.start();
 
-  // Safety cap for a long continuous utterance.
   clipTimer = setTimeout(() => {
     if (speaking) endClip(performance.now());
   }, MAX_CLIP_MS);
@@ -251,12 +255,11 @@ function endClip(now) {
 
   const duration = now - speechStart;
   if (duration < MIN_SPEECH_MS) {
-    // Too short — treat as noise, discard.
     if (mediaRecorder && mediaRecorder.state !== "inactive") {
       mediaRecorder.onstop = null;
       mediaRecorder.stop();
     }
-    setStatus("Listening… speak into the mic.");
+    setStatus("Live — listening. Just speak.");
     return;
   }
 
@@ -269,7 +272,7 @@ async function shipClip() {
   const blob = new Blob(chunks, { type });
   chunks = [];
   if (blob.size < 1200) {
-    setStatus("Listening… speak into the mic.");
+    setStatus("Live — listening. Just speak.");
     return;
   }
 
@@ -280,20 +283,14 @@ async function shipClip() {
   try {
     const resp = await fetch("/api/transcribe", { method: "POST", body: form });
     const data = await resp.json();
-
-    if (!resp.ok) {
-      addLog(data.error || "Transcription failed.", "err");
-    } else if (data.forwarded) {
-      addLog(data.text, "sent");
-    } else if (data.text) {
-      addLog(data.text + "  (not sent)", "skip");
-    } else {
-      addLog("No speech recognized.", "skip");
-    }
+    if (!resp.ok) addLog(data.error || "Transcription failed.", "err");
+    else if (data.forwarded) addLog(data.text, "sent");
+    else if (data.text) addLog(data.text + "  (not sent)", "skip");
+    else addLog("No speech recognized.", "skip");
   } catch (err) {
     addLog("Network error: " + err.message, "err");
   } finally {
-    if (running) setStatus("Listening… speak into the mic.");
+    if (running) setStatus("Live — listening. Just speak.");
   }
 }
 
