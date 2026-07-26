@@ -22,8 +22,15 @@ const GROQ_MODEL = process.env.GROQ_MODEL || "whisper-large-v3-turbo";
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL || "scribe_v1";
 
+// Primary + backup ElevenLabs keys. The backup is used automatically when the
+// primary is rejected (bad key) or out of quota. Filled at startup if missing.
+const ELEVENLABS_KEYS = {
+  primary: ELEVENLABS_API_KEY,
+  backup: process.env.ELEVENLABS_API_KEY_BACKUP || "",
+};
+
 function currentApiKey() {
-  if (PROVIDER === "elevenlabs") return ELEVENLABS_API_KEY;
+  if (PROVIDER === "elevenlabs") return ELEVENLABS_KEYS.primary || ELEVENLABS_KEYS.backup;
   if (PROVIDER === "groq") return GROQ_API_KEY;
   return OPENAI_API_KEY;
 }
@@ -43,6 +50,37 @@ const ADMIN_IDS = [
   .map((s) => s.trim())
   .filter(Boolean)
   .filter((v, i, a) => a.indexOf(v) === i);
+
+// ---- Forward gate ----
+// KEYWORDS: only transcripts mentioning one of these words are sent.
+// A transcript containing a number always passes (full sentence is sent).
+const KEYWORDS = String(
+  process.env.KEYWORDS ??
+    "received,credited,debited,payment,paid,transfer,transferred,sent,rupees,balance"
+)
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+// SEND_ON_NUMBER=false disables the "any number passes" rule.
+const SEND_ON_NUMBER = String(process.env.SEND_ON_NUMBER ?? "true").toLowerCase() !== "false";
+
+function shouldForward(text) {
+  const lower = text.toLowerCase();
+
+  // Numbers (digits, incl. the ₹ amounts we normalized) → send full sentence.
+  if (SEND_ON_NUMBER && /\d/.test(text)) return { pass: true, reason: "number" };
+
+  // Otherwise require one of the watched words.
+  const hit = KEYWORDS.find((k) => new RegExp(`\\b${escapeRegex(k)}\\b`).test(lower));
+  if (hit) return { pass: true, reason: `keyword:${hit}` };
+
+  return { pass: false, reason: "no keyword or number" };
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 const app = express();
 app.use(express.static(path.join(__dirname, "public")));
@@ -80,6 +118,16 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
     // Normalize: spoken numbers → digits, currency words → the ₹ (INR) symbol.
     const text = formatText(raw);
 
+    // Gate: forward only when a watched word is mentioned, OR the sentence
+    // contains a number (then the full sentence goes out).
+    const gate = shouldForward(text);
+    if (!gate.pass) {
+      console.log(
+        `${c.gray(new Date().toLocaleTimeString())} ${c.gray("· ignored")} ${c.gray(text)}`
+      );
+      return res.json({ text, forwarded: false, reason: gate.reason });
+    }
+
     let forwarded = false;
     if (TELEGRAM_BOT_TOKEN && ADMIN_IDS.length) {
       forwarded = await sendToTelegram(text);
@@ -88,18 +136,40 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
     console.log(
       `${c.gray(new Date().toLocaleTimeString())} ${
         forwarded ? c.green("→ sent") : c.yellow("· heard")
-      } ${c.reset(text)}`
+      } ${c.gray(`[${gate.reason}]`)} ${c.reset(text)}`
     );
 
-    res.json({ text, forwarded });
+    res.json({ text, forwarded, matched: gate.reason });
   } catch (err) {
     console.error(c.red("transcribe error:"), err.message);
     res.status(500).json({ error: err.message || "Transcription failed." });
   }
 });
 
-// ---- Transcription: routes to the configured best voice model ----
+// ---- Transcription: primary key, with automatic failover to the backup ----
 async function transcribe(file) {
+  if (PROVIDER === "elevenlabs") {
+    const keys = [ELEVENLABS_KEYS.primary, ELEVENLABS_KEYS.backup].filter(Boolean);
+    if (!keys.length) throw new Error("No ElevenLabs API key configured.");
+
+    let lastErr;
+    for (let i = 0; i < keys.length; i++) {
+      try {
+        return await callProvider(file, keys[i]);
+      } catch (err) {
+        lastErr = err;
+        const retryable = /\b(401|402|403|429)\b|quota|unauthorized|limit/i.test(err.message);
+        const hasNext = i < keys.length - 1;
+        if (!retryable || !hasNext) throw err;
+        console.warn(c.yellow(`  Primary ElevenLabs key failed (${err.message.slice(0, 80)}) — switching to backup key.`));
+      }
+    }
+    throw lastErr;
+  }
+  return callProvider(file);
+}
+
+async function callProvider(file, elevenKey) {
   const blob = new Blob([file.buffer], {
     type: file.mimetype || "audio/webm",
   });
@@ -113,9 +183,8 @@ async function transcribe(file) {
 
   if (PROVIDER === "elevenlabs") {
     // ElevenLabs Scribe — different endpoint, auth header, and field names.
-    if (!ELEVENLABS_API_KEY) throw new Error("ELEVENLABS_API_KEY is not set.");
     url = "https://api.elevenlabs.io/v1/speech-to-text";
-    headers = { "xi-api-key": ELEVENLABS_API_KEY };
+    headers = { "xi-api-key": elevenKey };
     form.append("model_id", ELEVENLABS_MODEL);
     form.append("language_code", "eng"); // English only (ISO-639-3)
   } else if (PROVIDER === "groq") {
@@ -321,6 +390,57 @@ function onListen(scheme) {
     );
   }
 }
+
+// ---- Ask for a backup ElevenLabs token at startup (skipped if already set) ----
+async function askBackupKey() {
+  if (PROVIDER !== "elevenlabs") return;
+  if (ELEVENLABS_KEYS.backup) {
+    console.log(c.dim("  Backup ElevenLabs key loaded from .env"));
+    return;
+  }
+  // Non-interactive (service/pm2/docker) — don't block startup.
+  if (!process.stdin.isTTY) return;
+
+  const answer = await prompt(
+    c.bold("  Backup ElevenLabs API token") + c.dim(" (press Enter to skip): ")
+  );
+  const key = answer.trim();
+  if (!key) {
+    console.log(c.dim("  No backup key set — continuing with the primary only."));
+    return;
+  }
+  ELEVENLABS_KEYS.backup = key;
+
+  // Persist to .env so you aren't asked again on the next start.
+  try {
+    const envPath = path.join(__dirname, ".env");
+    const line = `ELEVENLABS_API_KEY_BACKUP=${key}`;
+    let body = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf8") : "";
+    body = /^ELEVENLABS_API_KEY_BACKUP=.*$/m.test(body)
+      ? body.replace(/^ELEVENLABS_API_KEY_BACKUP=.*$/m, line)
+      : (body.endsWith("\n") || body === "" ? body : body + "\n") + line + "\n";
+    fs.writeFileSync(envPath, body);
+    console.log(c.green("  Backup key saved to .env"));
+  } catch (err) {
+    console.warn(c.yellow("  Could not save to .env: " + err.message));
+  }
+}
+
+function prompt(question) {
+  return new Promise((resolve) => {
+    process.stdout.write(question);
+    process.stdin.setEncoding("utf8");
+    const onData = (d) => {
+      process.stdin.removeListener("data", onData);
+      process.stdin.pause();
+      resolve(String(d));
+    };
+    process.stdin.resume();
+    process.stdin.on("data", onData);
+  });
+}
+
+await askBackupKey();
 
 if (hasCerts) {
   const creds = { key: fs.readFileSync(SSL_KEY), cert: fs.readFileSync(SSL_CERT) };
